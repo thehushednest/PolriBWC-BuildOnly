@@ -13,6 +13,7 @@ import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.util.Base64
+import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -63,6 +64,13 @@ class PttAudioBridge(
     private val isConnecting = AtomicBoolean(false)
     private val consecutiveSendFailures = AtomicInteger(0)
 
+    @Volatile
+    private var rxPacketCount: Long = 0
+
+    private companion object {
+        const val TAG = "PolriPtt"
+    }
+
     private val sampleRate = 16000
     private val channelInConfig = AudioFormat.CHANNEL_IN_MONO
     private val channelOutConfig = AudioFormat.CHANNEL_OUT_MONO
@@ -89,7 +97,9 @@ class PttAudioBridge(
         this.deviceId = deviceId
         isManualDisconnect = false
         emitState("connecting", detail = "Menghubungkan audio PTT…")
-        configureAudioRouting()
+        // Receiver-only path: jangan ubah audio mode/speakerphone agar RX
+        // tetap pakai STREAM_MUSIC (audible) dan tidak mengganggu call aktif.
+        ensureMediaVolumeAudible()
         connectInternal()
     }
 
@@ -122,7 +132,9 @@ class PttAudioBridge(
             emitError("Audio PTT belum dikonfigurasi.")
             return false
         }
-        configureAudioRouting()
+        // Hanya saat TX kita paksa mode komunikasi & speakerphone agar mic &
+        // loopback monitor berjalan optimal.
+        configureCommunicationAudioRouting()
         connectInternal()
 
         // Tunggu socket sebentar agar frame awal tidak hilang. Kalau socket
@@ -255,6 +267,9 @@ class PttAudioBridge(
         }
         audioRecord = null
         recorderThread = null
+        // Kembalikan mode audio ke NORMAL agar RX playback via STREAM_MUSIC
+        // tidak terkena efek routing mode komunikasi pada device tertentu.
+        resetAudioRouting()
         emitState(
             if (isSocketOpen) "connected" else "disconnected",
             detail = if (isSocketOpen) "Mikrofon PTT berhenti." else "Audio PTT terputus.",
@@ -286,7 +301,14 @@ class PttAudioBridge(
                         isConnecting.set(false)
                         consecutiveSendFailures.set(0)
                         stopReconnect()
-                        configureAudioRouting()
+                        // Saat onOpen, kita hanya RX (atau belum tahu) — jangan
+                        // paksa mode komunikasi. Cukup pastikan media volume
+                        // audible dan siapkan AudioTrack lewat STREAM_MUSIC.
+                        if (isCapturing.get()) {
+                            configureCommunicationAudioRouting()
+                        } else {
+                            ensureMediaVolumeAudible()
+                        }
                         ensureAudioTrack()
                         emitState("connected", detail = "Socket audio PTT terhubung, menyiapkan hello.")
                         val sent = sendJson(
@@ -361,7 +383,14 @@ class PttAudioBridge(
                 "audio" -> {
                     val from = json.optString("username")
                     val incomingChannelId = json.optString("channelId")
-                    if (from == username || incomingChannelId != channelId) return
+                    if (from == username) return
+                    if (incomingChannelId != channelId) {
+                        Log.d(
+                            TAG,
+                            "drop-rx channel mismatch self=$channelId pkt=$incomingChannelId from=$from",
+                        )
+                        return
+                    }
                     val payload = json.optString("payload")
                     if (payload.isBlank()) return
                     val bytes = Base64.decode(payload, Base64.DEFAULT)
@@ -369,9 +398,29 @@ class PttAudioBridge(
                     // listener OkHttp tidak terblok saat buffer speaker penuh.
                     playbackExecutor.execute {
                         ensureAudioTrack()
+                        val track = audioTrack
+                        if (track == null) {
+                            Log.w(TAG, "rx audioTrack null, drop ${bytes.size} bytes from=$from")
+                            return@execute
+                        }
                         try {
-                            audioTrack?.write(bytes, 0, bytes.size)
-                        } catch (_: Exception) {
+                            val written = track.write(bytes, 0, bytes.size)
+                            rxPacketCount++
+                            if (rxPacketCount == 1 || rxPacketCount % 50 == 0) {
+                                Log.d(
+                                    TAG,
+                                    "rx#$rxPacketCount from=$from bytes=${bytes.size} written=$written state=${track.playState}",
+                                )
+                            }
+                            // Safety net: pastikan track sedang playing.
+                            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                                try {
+                                    track.play()
+                                } catch (_: Exception) {
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "rx write error: ${e.message}")
                         }
                     }
                 }
@@ -391,34 +440,91 @@ class PttAudioBridge(
 
     private fun ensureAudioTrack() {
         if (audioTrack != null) return
-        configureAudioRouting()
+        ensureMediaVolumeAudible()
         val minBuffer = AudioTrack.getMinBufferSize(sampleRate, channelOutConfig, audioEncoding)
-        if (minBuffer <= 0) return
+        if (minBuffer <= 0) {
+            Log.w(TAG, "getMinBufferSize returned $minBuffer, cannot build AudioTrack")
+            return
+        }
+        val bufferBytes = maxOf(minBuffer * 2, frameBytes * 8)
+        // USAGE_MEDIA -> STREAM_MUSIC supaya RX mengikuti media volume (selalu
+        // audible) dan tidak bergantung MODE_IN_COMMUNICATION / STREAM_VOICE_CALL
+        // yang seringkali senyap pada receiver.
         val preferredSpeaker = findBuiltInSpeaker()
-        audioTrack = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build(),
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(audioEncoding)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(channelOutConfig)
-                    .build(),
-            )
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(maxOf(minBuffer * 2, frameBytes * 8))
-            .build()
-            .apply {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && preferredSpeaker != null) {
-                    setPreferredDevice(preferredSpeaker)
-                }
-                play()
-                setVolume(1.0f)
+        val track = try {
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build(),
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(audioEncoding)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(channelOutConfig)
+                        .build(),
+                )
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setBufferSizeInBytes(bufferBytes)
+                .build()
+        } catch (e: Exception) {
+            Log.e(TAG, "AudioTrack.Builder failed: ${e.message}")
+            return
+        }
+        if (track.state != AudioTrack.STATE_INITIALIZED) {
+            Log.w(TAG, "AudioTrack not initialized (state=${track.state})")
+            try {
+                track.release()
+            } catch (_: Exception) {
             }
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && preferredSpeaker != null) {
+            try {
+                track.preferredDevice = preferredSpeaker
+            } catch (_: Exception) {
+            }
+        }
+        try {
+            track.setVolume(1.0f)
+        } catch (_: Exception) {
+        }
+        try {
+            track.play()
+        } catch (e: Exception) {
+            Log.e(TAG, "AudioTrack.play failed: ${e.message}")
+            try {
+                track.release()
+            } catch (_: Exception) {
+            }
+            return
+        }
+        audioTrack = track
+        Log.d(
+            TAG,
+            "AudioTrack ready rate=$sampleRate buffer=$bufferBytes state=${track.playState}",
+        )
+    }
+
+    private fun ensureMediaVolumeAudible() {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        try {
+            val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (current < max / 2) {
+                // Jangan paksa full supaya tidak kaget; cukup naikkan ke setengah
+                // bila terlalu pelan.
+                audioManager.setStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    max / 2,
+                    0,
+                )
+                Log.d(TAG, "raise STREAM_MUSIC volume $current -> ${max / 2}")
+            }
+        } catch (_: Exception) {
+        }
     }
 
     private fun enableAudioEffects(audioSessionId: Int) {
@@ -436,7 +542,7 @@ class PttAudioBridge(
         }
     }
 
-    private fun configureAudioRouting() {
+    private fun configureCommunicationAudioRouting() {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         try {
             audioManager.stopBluetoothSco()
