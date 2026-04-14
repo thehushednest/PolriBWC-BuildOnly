@@ -1602,8 +1602,17 @@ class PttAudioRelayServer {
           '[${_clockNow()}][audio-drop] $username@$channelId bukan floor holder',
         );
       }
+      if (sender.deniedPacketCount == 1) {
+        sender.send({
+          'type': 'floor_lost',
+          'channelId': channelId,
+          'username': username,
+          'reason': 'not_floor_holder',
+        });
+      }
       return;
     }
+    sender.deniedPacketCount = 0;
     sender.audioPacketCount += 1;
     if (sender.audioPacketCount == 1 || sender.audioPacketCount % 50 == 0) {
       stdout.writeln(
@@ -1667,8 +1676,20 @@ class PttAudioWebSocketRelay {
           '[${_clockNow()}][audio-ws-drop] $username@$channelId bukan floor holder',
         );
       }
+      // Beri tahu klien sekali (di paket pertama yang ditolak) agar bisa
+      // membersihkan state transmit-nya dan tidak terus membanjiri relay.
+      if (sender.deniedPacketCount == 1) {
+        sender.send({
+          'type': 'floor_lost',
+          'channelId': channelId,
+          'username': username,
+          'reason': 'not_floor_holder',
+        });
+      }
       return;
     }
+    // Reset penghitung kalau sebelumnya sempat ditolak.
+    sender.deniedPacketCount = 0;
     sender.audioPacketCount += 1;
     if (sender.audioPacketCount == 1 || sender.audioPacketCount % 50 == 0) {
       stdout.writeln(
